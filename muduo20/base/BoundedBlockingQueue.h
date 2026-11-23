@@ -1,0 +1,115 @@
+#pragma once
+
+#include "muduo20/base/noncopyable.h"
+
+#include <concepts>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <stop_token>
+#include <utility>
+
+namespace muduo20 {
+
+template <typename T>
+  requires std::movable<T>
+class BoundedBlockingQueue : noncopyable {
+public:
+  explicit BoundedBlockingQueue(int maxSize)
+      : maxSize_(static_cast<size_t>(maxSize)) {
+    if (maxSize <= 0) {
+      throw std::invalid_argument("BoundedBlockingQueue maxSize must be > 0");
+    }
+  }
+
+  void put(const T &x)
+    requires std::copy_constructible<T>
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notFull_.wait(lock, [this] { return queue_.size() < maxSize_; });
+    queue_.push_back(x);
+    lock.unlock();
+    notEmpty_.notify_one();
+  }
+
+  void put(T &&x) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notFull_.wait(lock, [this] { return queue_.size() < maxSize_; });
+    queue_.push_back(std::move(x));
+    lock.unlock();
+    notEmpty_.notify_one();
+  }
+
+  template <typename... Args> void emplace(Args &&...args) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notFull_.wait(lock, [this] { return queue_.size() < maxSize_; });
+    queue_.push_back(T(std::forward<Args>(args)...));
+    lock.unlock();
+    notEmpty_.notify_one();
+  }
+
+  T take() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notEmpty_.wait(lock, [this] { return !queue_.empty(); });
+    T front(std::move(queue_.front()));
+    queue_.pop_front();
+    lock.unlock();
+    notFull_.notify_one();
+    return front;
+  }
+
+  [[nodiscard]] std::optional<T> take(std::stop_token stopToken) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notEmpty_.wait(lock, stopToken, [this] { return !queue_.empty(); });
+    if (queue_.empty()) {
+      return std::nullopt;
+    }
+    T front(std::move(queue_.front()));
+    queue_.pop_front();
+    lock.unlock();
+    notFull_.notify_one();
+    return front;
+  }
+
+  [[nodiscard]] std::optional<T> try_take() {
+    std::scoped_lock lock(mutex_);
+    if (queue_.empty()) {
+      return std::nullopt;
+    }
+    T front(std::move(queue_.front()));
+    queue_.pop_front();
+    notFull_.notify_one();
+    return front;
+  }
+
+  [[nodiscard]] bool empty() const {
+    std::scoped_lock lock(mutex_);
+    return queue_.empty();
+  }
+
+  [[nodiscard]] bool full() const {
+    std::scoped_lock lock(mutex_);
+    return queue_.size() == maxSize_;
+  }
+
+  [[nodiscard]] size_t size() const {
+    std::scoped_lock lock(mutex_);
+    return queue_.size();
+  }
+
+  [[nodiscard]] size_t capacity() const {
+    return maxSize_;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::condition_variable_any notEmpty_;
+  std::condition_variable_any notFull_;
+  std::deque<T> queue_;
+  size_t maxSize_;
+};
+
+} // namespace muduo20

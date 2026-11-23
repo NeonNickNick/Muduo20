@@ -1,0 +1,219 @@
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <format>
+#include <muduo20/base/noncopyable.h>
+#include <span>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <type_traits>
+
+using namespace std::string_view_literals;
+
+namespace muduo20 {
+
+namespace detail {
+
+inline constexpr size_t kSmallBuffer = 4000;
+inline constexpr size_t kLargeBuffer = 4000ULL * 1000ULL;
+
+template <size_t SIZE> class FixedBuffer : noncopyable {
+  public:
+    FixedBuffer() = default;
+
+#if MUDUO20_ENABLE_LEGACY_COMPAT
+    void append(const char *buf, size_t len) {
+        // Append as much as possible (partial write)
+        size_t n = std::min(len, static_cast<size_t>(avail()));
+        std::memcpy(current(), buf, n);
+        writePos_ += n;
+    }
+#endif
+
+    void append(std::string_view str) {
+        const size_t n = std::min(str.size(), static_cast<size_t>(avail()));
+        std::memcpy(current(), str.data(), n);
+        writePos_ += n;
+    }
+
+    [[nodiscard]] const char *data() const { return data_.data(); }
+    [[nodiscard]] int length() const { return static_cast<int>(writePos_); }
+
+    char *current() { return data_.data() + writePos_; }
+    [[nodiscard]] int avail() const {
+        return static_cast<int>(data_.size() - writePos_);
+    }
+    void add(size_t len) { writePos_ += len; }
+
+    void reset() { writePos_ = 0; }
+    void bzero() { std::ranges::fill(data_, '\0'); }
+
+    [[nodiscard]] std::string toString() const {
+        return std::string(data_.data(), static_cast<size_t>(length()));
+    }
+    [[nodiscard]] std::string_view toStringView() const {
+        return std::string_view(data_.data(), static_cast<size_t>(length()));
+    }
+
+    [[nodiscard]] std::span<const char> readableSpan() const {
+        return std::span<const char>(data_.data(),
+                                     static_cast<size_t>(length()));
+    }
+
+    [[nodiscard]] std::span<char> writableSpan() {
+        return std::span<char>{
+            data_.data() + writePos_,
+            data_.size() - writePos_,
+        };
+    }
+
+  private:
+    std::array<char, SIZE> data_;
+    size_t writePos_ = 0;
+};
+
+} // namespace detail
+
+class LogStream : noncopyable {
+  public:
+    using Buffer = detail::FixedBuffer<detail::kSmallBuffer>;
+
+    LogStream &operator<<(bool v) {
+        buffer_.append(v ? "1"sv : "0"sv);
+        return *this;
+    }
+
+    LogStream &operator<<(char v) {
+        const std::array<char, 1> ch{v};
+        buffer_.append(std::string_view{ch.data(), ch.size()});
+        return *this;
+    }
+
+    template <std::integral T>
+        requires(!std::same_as<std::remove_cvref_t<T>, bool> &&
+                 !std::same_as<std::remove_cvref_t<T>, char>)
+    LogStream &operator<<(T v) {
+        return formatInteger(v);
+    }
+
+    LogStream &operator<<(const void *p) {
+        if (buffer_.avail() >= kMaxNumericSize) {
+            auto out =
+                std::format_to_n(buffer_.current(), buffer_.avail(), "{}", p);
+            buffer_.add(std::min(static_cast<size_t>(out.size),
+                                 static_cast<size_t>(buffer_.avail())));
+        }
+        return *this;
+    }
+
+    template <std::floating_point T> LogStream &operator<<(T v) {
+        return formatFloating(v);
+    }
+
+    LogStream &operator<<(const char *str) {
+        if (str != nullptr) {
+            buffer_.append(
+                std::string_view{str, std::char_traits<char>::length(str)});
+        } else {
+            buffer_.append("(null)"sv);
+        }
+        return *this;
+    }
+
+    LogStream &operator<<(const unsigned char *str) {
+        return *this << reinterpret_cast<const char *>(str);
+    }
+
+    LogStream &operator<<(std::string_view v) {
+        buffer_.append(v);
+        return *this;
+    }
+
+    LogStream &operator<<(const std::string &v) {
+        buffer_.append(v);
+        return *this;
+    }
+
+    LogStream &operator<<(const Buffer &v) {
+        buffer_.append(v.toStringView());
+        return *this;
+    }
+
+#if MUDUO20_ENABLE_LEGACY_COMPAT
+    void append(const char *data, int len) {
+        buffer_.append(std::string_view{data, static_cast<size_t>(len)});
+    }
+#endif
+
+    void append(std::string_view v) { buffer_.append(v); }
+
+    template <typename... Args>
+    LogStream &format(std::format_string<Args...> fmt, Args &&...args) {
+        if (buffer_.avail() <= 0) {
+            return *this;
+        }
+        const auto cap = static_cast<size_t>(buffer_.avail());
+        auto out = std::format_to_n(buffer_.current(),
+                                    static_cast<std::ptrdiff_t>(cap), fmt,
+                                    std::forward<Args>(args)...);
+        const size_t written = std::min(static_cast<size_t>(out.size), cap);
+        buffer_.add(written);
+        return *this;
+    }
+
+    [[nodiscard]] const Buffer &buffer() const { return buffer_; }
+    void resetBuffer() { buffer_.reset(); }
+
+  private:
+    static constexpr int kMaxNumericSize = 48;
+
+    template <std::integral T> LogStream &formatInteger(T v) {
+        if (buffer_.avail() >= kMaxNumericSize) {
+            char *cur = buffer_.current();
+            auto [ptr, ec] = std::to_chars(cur, cur + buffer_.avail(), v);
+            if (ec == std::errc{}) {
+                buffer_.add(static_cast<size_t>(ptr - cur));
+            }
+        }
+        return *this;
+    }
+
+    template <std::floating_point T> LogStream &formatFloating(T v) {
+        if (buffer_.avail() >= kMaxNumericSize) {
+            char *cur = buffer_.current();
+            char *end = cur + buffer_.avail();
+
+            if constexpr (!std::same_as<std::remove_cvref_t<T>, long double>) {
+                auto [ptr, ec] = std::to_chars(cur, end, static_cast<double>(v),
+                                               std::chars_format::general, 12);
+                if (ec == std::errc{}) {
+                    buffer_.add(static_cast<size_t>(ptr - cur));
+                    return *this;
+                }
+            }
+
+            const auto cap = static_cast<size_t>(buffer_.avail());
+            auto out = std::format_to_n(cur, static_cast<std::ptrdiff_t>(cap),
+                                        "{:.12g}", v);
+            const size_t written = std::min(static_cast<size_t>(out.size), cap);
+            buffer_.add(written);
+        }
+        return *this;
+    }
+
+    Buffer buffer_;
+};
+void appendSI(LogStream &s, int64_t n);
+void appendIEC(LogStream &s, int64_t n);
+
+[[nodiscard]] std::string formatSI(int64_t n);
+[[nodiscard]] std::string formatIEC(int64_t n);
+
+} // namespace muduo20

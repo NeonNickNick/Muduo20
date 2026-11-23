@@ -1,0 +1,357 @@
+#pragma once
+
+#include "muduo20/base/LogStream.h"
+
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <optional>
+#include <source_location>
+#include <string_view>
+#include <utility>
+
+namespace muduo20 {
+
+class TimeZone;
+
+class Logger {
+public:
+  enum class LogLevel : std::uint8_t {
+    TRACE,
+    DEBUG,
+    INFO,
+    WARN,
+    ERROR,
+    FATAL,
+    NUM_LOG_LEVELS,
+  };
+
+  // Legacy aliases for source compatibility with old muduo20 code.
+  static constexpr LogLevel TRACE = LogLevel::TRACE;
+  static constexpr LogLevel DEBUG = LogLevel::DEBUG;
+  static constexpr LogLevel INFO = LogLevel::INFO;
+  static constexpr LogLevel WARN = LogLevel::WARN;
+  static constexpr LogLevel ERROR = LogLevel::ERROR;
+  static constexpr LogLevel FATAL = LogLevel::FATAL;
+
+#if MUDUO20_ENABLE_LEGACY_COMPAT
+  class SourceFile {
+  public:
+    template <int N> explicit SourceFile(const char (&arr)[N]) noexcept {
+      std::string_view full{arr, static_cast<size_t>(N - 1)};
+      const auto pos = full.find_last_of('/');
+      if (pos == std::string_view::npos) {
+        data_ = arr;
+        size_ = N - 1;
+      } else {
+        data_ = arr + static_cast<std::ptrdiff_t>(pos + 1);
+        size_ = static_cast<int>(full.size() - pos - 1);
+      }
+    }
+
+    explicit SourceFile(const char *filename) noexcept {
+      if (filename == nullptr) {
+        data_ = "unknown";
+        size_ = 7;
+        return;
+      }
+      std::string_view full{filename};
+      const auto pos = full.find_last_of('/');
+      if (pos == std::string_view::npos) {
+        data_ = filename;
+        size_ = static_cast<int>(full.size());
+      } else {
+        data_ = filename + static_cast<std::ptrdiff_t>(pos + 1);
+        size_ = static_cast<int>(full.size() - pos - 1);
+      }
+    }
+
+    const char *data_{"unknown"};
+    int size_{7};
+  };
+#endif
+
+  explicit Logger(LogLevel level = LogLevel::INFO, int savedErrno = 0,
+                  std::string_view func = {},
+                  std::source_location loc = std::source_location::current());
+
+#if MUDUO20_ENABLE_LEGACY_COMPAT
+  Logger(SourceFile file, int line);
+  Logger(SourceFile file, int line, LogLevel level);
+  Logger(SourceFile file, int line, LogLevel level, const char *func);
+  Logger(SourceFile file, int line, bool toAbort);
+#endif
+  ~Logger();
+
+  Logger(const Logger &) = delete;
+  Logger &operator=(const Logger &) = delete;
+
+  [[nodiscard]] LogStream &stream() { return impl_.stream_; }
+
+  [[nodiscard]] static LogLevel logLevel();
+  static void setLogLevel(LogLevel level);
+
+  using OutputFunc = void (*)(const char *msg, int len);
+  using FlushFunc = void (*)();
+  static void setOutput(OutputFunc);
+  static void setFlush(FlushFunc);
+  static void setTimeZone(const TimeZone &tz);
+
+private:
+  class Impl {
+  public:
+    Impl(LogLevel level, int savedErrno, std::string_view func,
+         std::source_location loc);
+    Impl(LogLevel level, int savedErrno, std::string_view func,
+         const char *basename, std::uint_least32_t line) noexcept;
+
+    void finish();
+
+    std::chrono::sys_time<std::chrono::microseconds> time_;
+    LogStream stream_;
+    LogLevel level_;
+    std::uint_least32_t line_;
+    const char *basename_;
+  };
+
+  Impl impl_;
+};
+
+extern Logger::LogLevel g_logLevel;
+
+[[nodiscard]] const char *strerror_tl(int savedErrno);
+
+template <typename... Args>
+inline void logFmt(Logger::LogLevel level, std::source_location loc,
+                   std::format_string<Args...> fmt, Args &&...args) {
+  if (Logger::logLevel() <= level) {
+    auto &stream = Logger(level, 0, {}, loc).stream();
+    if constexpr (sizeof...(Args) == 0) {
+      stream.append(fmt.get());
+    } else {
+      stream.format(fmt, std::forward<Args>(args)...);
+    }
+  }
+}
+
+template <typename... Args>
+inline void logFmtErr(Logger::LogLevel level, int savedErrno,
+                      std::source_location loc, std::format_string<Args...> fmt,
+                      Args &&...args) {
+  if (Logger::logLevel() <= level) {
+    auto &s = Logger(level, savedErrno, {}, loc).stream();
+    if constexpr (sizeof...(Args) == 0) {
+      s.append(fmt.get());
+    } else {
+      s.format(fmt, std::forward<Args>(args)...);
+    }
+  }
+}
+
+[[nodiscard]] inline bool shouldLog(Logger::LogLevel level) {
+  return level >= Logger::LogLevel::WARN || Logger::logLevel() <= level;
+}
+
+class LogLine {
+public:
+  explicit LogLine(Logger::LogLevel level, int savedErrno = 0,
+                   std::string_view func = {},
+                   std::source_location loc = std::source_location::current())
+      : enabled_(shouldLog(level)) {
+    if (enabled_) {
+      logger_.emplace(level, savedErrno, func, loc);
+    }
+  }
+
+  template <typename T> LogLine &operator<<(T &&value) {
+    if (enabled_) {
+      logger_->stream() << std::forward<T>(value);
+    }
+    return *this;
+  }
+
+  template <typename... Args>
+  LogLine &format(std::format_string<Args...> fmt, Args &&...args) {
+    if (enabled_) {
+      logger_->stream().format(fmt, std::forward<Args>(args)...);
+    }
+    return *this;
+  }
+
+private:
+  bool enabled_;
+  std::optional<Logger> logger_;
+};
+
+[[nodiscard]] inline LogLine
+logTrace(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::TRACE, 0, loc.function_name(), loc);
+}
+
+[[nodiscard]] inline LogLine
+logDebug(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::DEBUG, 0, loc.function_name(), loc);
+}
+
+[[nodiscard]] inline LogLine
+logInfo(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::INFO, 0, {}, loc);
+}
+
+[[nodiscard]] inline LogLine
+logWarn(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::WARN, 0, {}, loc);
+}
+
+[[nodiscard]] inline LogLine
+logError(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::ERROR, 0, {}, loc);
+}
+
+[[nodiscard]] inline LogLine
+logFatal(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::FATAL, 0, {}, loc);
+}
+
+[[nodiscard]] inline LogLine
+logSysErr(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::ERROR, errno, {}, loc);
+}
+
+[[nodiscard]] inline LogLine
+logSysFatal(std::source_location loc = std::source_location::current()) {
+  return LogLine(Logger::LogLevel::FATAL, errno, {}, loc);
+}
+
+template <typename... Args>
+inline void logTrace(std::format_string<Args...> fmt, Args &&...args) {
+  if (Logger::logLevel() <= Logger::LogLevel::TRACE) {
+    logFmt(Logger::LogLevel::TRACE, std::source_location::current(), fmt,
+           std::forward<Args>(args)...);
+  }
+}
+
+template <typename... Args>
+inline void logDebug(std::format_string<Args...> fmt, Args &&...args) {
+  if (Logger::logLevel() <= Logger::LogLevel::DEBUG) {
+    logFmt(Logger::LogLevel::DEBUG, std::source_location::current(), fmt,
+           std::forward<Args>(args)...);
+  }
+}
+
+template <typename... Args>
+inline void logInfo(std::format_string<Args...> fmt, Args &&...args) {
+  if (Logger::logLevel() <= Logger::LogLevel::INFO) {
+    logFmt(Logger::LogLevel::INFO, std::source_location::current(), fmt,
+           std::forward<Args>(args)...);
+  }
+}
+
+template <typename... Args>
+inline void logWarn(std::format_string<Args...> fmt, Args &&...args) {
+  logFmt(Logger::LogLevel::WARN, std::source_location::current(), fmt,
+         std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+inline void logError(std::format_string<Args...> fmt, Args &&...args) {
+  logFmt(Logger::LogLevel::ERROR, std::source_location::current(), fmt,
+         std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+inline void logFatal(std::format_string<Args...> fmt, Args &&...args) {
+  logFmt(Logger::LogLevel::FATAL, std::source_location::current(), fmt,
+         std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+inline void logSysErr(std::format_string<Args...> fmt, Args &&...args) {
+  logFmtErr(Logger::LogLevel::ERROR, errno, std::source_location::current(),
+            fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+inline void logSysFatal(std::format_string<Args...> fmt, Args &&...args) {
+  logFmtErr(Logger::LogLevel::FATAL, errno, std::source_location::current(),
+            fmt, std::forward<Args>(args)...);
+}
+
+template <typename T>
+T *CheckNotNull(const char *names, T *ptr,
+                std::source_location loc = std::source_location::current()) {
+  if (ptr == nullptr) {
+    Logger(Logger::LogLevel::FATAL, 0, {}, loc).stream() << names;
+  }
+  return ptr;
+}
+
+#if MUDUO20_ENABLE_LEGACY_COMPAT
+template <typename T>
+T *CheckNotNull(Logger::SourceFile file, int line, const char *names, T *ptr) {
+  if (ptr == nullptr) {
+    Logger(file, line, Logger::LogLevel::FATAL).stream() << names;
+  }
+  return ptr;
+}
+
+template <typename T>
+T *CheckNotNull(const char *file, int line, const char *names, T *ptr) {
+  return CheckNotNull(Logger::SourceFile(file), line, names, ptr);
+}
+#endif
+
+#if MUDUO20_ENABLE_LEGACY_COMPAT
+#define LOG_TRACE                                                              \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::TRACE))                   \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logTrace()
+
+#define LOG_DEBUG                                                              \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::DEBUG))                   \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logDebug()
+
+#define LOG_INFO                                                               \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::INFO))                    \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logInfo()
+
+#define LOG_WARN                                                               \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::WARN))                    \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logWarn()
+
+#define LOG_ERROR                                                              \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::ERROR))                   \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logError()
+
+#define LOG_FATAL                                                              \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::FATAL))                   \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logFatal()
+
+#define LOG_SYSERR                                                             \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::ERROR))                   \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logSysErr()
+
+#define LOG_SYSFATAL                                                           \
+  if (!::muduo20::shouldLog(::muduo20::Logger::LogLevel::FATAL))                   \
+    ;                                                                          \
+  else                                                                         \
+    ::muduo20::logSysFatal()
+#define CHECK_NOTNULL(val)                                                     \
+  ::muduo20::CheckNotNull(__FILE__, __LINE__, "'" #val "' Must be non NULL",     \
+                        (val))
+#endif
+
+} // namespace muduo20

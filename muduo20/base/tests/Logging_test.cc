@@ -1,0 +1,136 @@
+#include "muduo20/base/Logging.h"
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <latch>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+std::mutex g_logMutex;
+std::string g_logOutput;
+
+void testOutput(const char *msg, int len) {
+    std::scoped_lock lock(g_logMutex);
+    g_logOutput.append(msg, static_cast<size_t>(len));
+}
+
+void testFlush() {}
+
+void clearLogOutput() {
+    std::scoped_lock lock(g_logMutex);
+    g_logOutput.clear();
+}
+
+std::string snapshotLogOutput() {
+    std::scoped_lock lock(g_logMutex);
+    return g_logOutput;
+}
+
+size_t countOccurrences(const std::string &s, std::string_view token) {
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = s.find(token, pos)) != std::string::npos) {
+        ++count;
+        pos += token.size();
+    }
+    return count;
+}
+
+} // namespace
+
+TEST(Logging, FormatApiWritesExpectedMessage) {
+    clearLogOutput();
+
+    muduo20::Logger::setOutput(testOutput);
+    muduo20::Logger::setFlush(testFlush);
+    muduo20::Logger::setLogLevel(muduo20::Logger::LogLevel::INFO);
+
+    muduo20::logInfo("hello-fmt {}", 42);
+    muduo20::logInfo("hello-next {}", "ok");
+
+    const std::string out = snapshotLogOutput();
+    EXPECT_NE(out.find("hello-fmt 42"), std::string::npos);
+    EXPECT_NE(out.find("hello-next ok"), std::string::npos);
+}
+
+TEST(Logging, LogLevelSuppressesInfo) {
+    clearLogOutput();
+
+    muduo20::Logger::setOutput(testOutput);
+    muduo20::Logger::setFlush(testFlush);
+    muduo20::Logger::setLogLevel(muduo20::Logger::LogLevel::WARN);
+
+    muduo20::logInfo("fmt-should-not-appear {}", 1);
+    muduo20::logWarn("warn-appears");
+
+    const std::string out = snapshotLogOutput();
+    EXPECT_EQ(out.find("should-not-appear"), std::string::npos);
+    EXPECT_EQ(out.find("fmt-should-not-appear"), std::string::npos);
+    EXPECT_NE(out.find("warn-appears"), std::string::npos);
+}
+
+TEST(Logging, LogLevelCoverageAcrossTraceToError) {
+    clearLogOutput();
+
+    muduo20::Logger::setOutput(testOutput);
+    muduo20::Logger::setFlush(testFlush);
+    muduo20::Logger::setLogLevel(muduo20::Logger::LogLevel::INFO);
+
+    muduo20::logTrace("trace-hidden");
+    muduo20::logDebug("debug-hidden");
+    muduo20::logInfo("info-visible");
+    muduo20::logWarn("warn-visible");
+    muduo20::logError("error-visible");
+
+    std::string out = snapshotLogOutput();
+    EXPECT_EQ(out.find("trace-hidden"), std::string::npos);
+    EXPECT_EQ(out.find("debug-hidden"), std::string::npos);
+    EXPECT_NE(out.find("info-visible"), std::string::npos);
+    EXPECT_NE(out.find("warn-visible"), std::string::npos);
+    EXPECT_NE(out.find("error-visible"), std::string::npos);
+
+    clearLogOutput();
+    muduo20::Logger::setLogLevel(muduo20::Logger::LogLevel::TRACE);
+    muduo20::logTrace("trace-visible");
+    muduo20::logDebug("debug-visible");
+    out = snapshotLogOutput();
+    EXPECT_NE(out.find("trace-visible"), std::string::npos);
+    EXPECT_NE(out.find("debug-visible"), std::string::npos);
+}
+
+TEST(Logging, MultiThreadStressNoLoss) {
+    clearLogOutput();
+
+    muduo20::Logger::setOutput(testOutput);
+    muduo20::Logger::setFlush(testFlush);
+    muduo20::Logger::setLogLevel(muduo20::Logger::LogLevel::INFO);
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 800;
+    std::latch ready(kThreads);
+    std::vector<std::jthread> workers;
+    workers.reserve(kThreads);
+
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([t, &ready](std::stop_token) {
+            ready.count_down();
+            ready.wait();
+            for (int i = 0; i < kPerThread; ++i) {
+                muduo20::logInfo("mt-thread={} seq={}", t, i);
+            }
+        });
+    }
+
+    for (auto &worker : workers) {
+        worker.join();
+    }
+
+    const std::string out = snapshotLogOutput();
+    const size_t count = countOccurrences(out, "mt-thread=");
+    EXPECT_EQ(count, static_cast<size_t>(kThreads * kPerThread));
+}

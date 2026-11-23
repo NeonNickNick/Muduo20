@@ -1,0 +1,15 @@
+#include "muduo20/net/Timer.h"
+
+#include <utility>
+
+using namespace muduo20::net;
+
+std::atomic<std::int64_t> Timer::s_numCreated_{0};
+
+void Timer::restart(Timestamp now) {
+  if (repeat_) {
+    expiration_ = Timestamp{now.timePoint() + interval_};
+  } else {
+    expiration_ = Timestamp::invalid();
+  }
+}
